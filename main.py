@@ -43,14 +43,11 @@ def setup_workspace(workspace_name=WORKSPACE_NAME, drive=WORKSPACE_DRIVE):
 
 @app.post("/upload_files")
 async def upload_files(files: List[UploadFile] = File(...)):
-    """
-    Upload multiple files to the workspace
-    """
+    
     try:
-        # Get the workspace path
+        
         workspace_path = os.path.join(WORKSPACE_DRIVE, os.sep, WORKSPACE_NAME)
         
-        # Create workspace if it doesn't exist
         if not os.path.exists(workspace_path):
             os.makedirs(workspace_path, exist_ok=True)
         
@@ -58,11 +55,11 @@ async def upload_files(files: List[UploadFile] = File(...)):
         
         for file in files:
             if file.filename:
-                # Create a safe filename
+               
                 safe_filename = file.filename.replace(" ", "_")
                 file_path = os.path.join(workspace_path, safe_filename)
                 
-                # Save the file
+                
                 with open(file_path, "wb") as buffer:
                     content = await file.read()
                     buffer.write(content)
@@ -89,4 +86,49 @@ async def upload_files(files: List[UploadFile] = File(...)):
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred during file upload: {str(e)}"
+        )
+
+@app.post("/upload_folders")
+async def upload_folders(folders: List[UploadFile] = File(...)):
+    
+    try:
+        
+        workspace_path = os.path.join(WORKSPACE_DRIVE, os.sep, WORKSPACE_NAME)
+        
+        if not os.path.exists(workspace_path):
+            os.makedirs(workspace_path, exist_ok=True)
+        
+        uploaded_folders = []
+        
+        for folder in folders:
+            if folder.filename:
+                
+                safe_folder_name = folder.filename.replace(" ", "_")
+                folder_path = os.path.join(workspace_path, safe_folder_name)
+                
+                
+                os.makedirs(folder_path, exist_ok=True)
+                
+                uploaded_folders.append({
+                    "folder_name": folder.filename,
+                    "saved_as": safe_folder_name,
+                    "path": folder_path
+                })
+        
+        return {
+            "status": "success",
+            "message": f"Successfully created {len(uploaded_folders)} folder(s) in workspace",
+            "uploaded_folders": uploaded_folders,
+            "workspace_path": workspace_path
+        }
+        
+    except PermissionError:
+        raise HTTPException(
+            status_code=403,
+            detail="Permission denied. Could not write to workspace directory."
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during folder creation: {str(e)}"
         )
