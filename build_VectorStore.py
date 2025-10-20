@@ -20,7 +20,6 @@ except ImportError:
 
 WORKSPACE_PATH = r"C:\MyRAG_Knowledge_Base"
 
-
 WHITELIST_EXTENSIONS = {
     ".py", ".cs", ".js", ".ts", ".java", ".go",
     ".html", ".css", ".md", ".txt", ".json",
@@ -28,7 +27,6 @@ WHITELIST_EXTENSIONS = {
     ".pdf" ,".jsx",".tsx",".java",".go",".cs",".cshtml",".md","ppt","pptx"
 }
 
-# BLACKLIST: Includes build folders and other noise generators.
 BLACKLIST_FOLDERS = {
     "node_modules", "__pycache__", "venv", "env", ".git", ".idea", ".vscode",
     "dist", "build", "target", ".next", ".nuxt",
@@ -54,19 +52,35 @@ class SimpleEmbeddings:
 
 
 class SimpleVectorStore:
-    def __init__(self, collection_name: str = CHROMA_COLLECTION_NAME):
-       
+    def __init__(self, collection_name: str = CHROMA_COLLECTION_NAME, reset: bool = True):
         self.client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
         
-       
-        try:
-            self.client.delete_collection(name=collection_name)
-            print(f"Deleted old Chroma collection '{collection_name}'.")
-        except Exception:
-            pass 
-            
-        self.collection = self.client.create_collection(collection_name)
+        if reset:
+            try:
+                self.client.delete_collection(name=collection_name)
+                print(f"Deleted old Chroma collection '{collection_name}'.")
+            except Exception:
+                pass 
+        
+        self.collection = self.client.create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"}
+        )
         print(f"Created new Chroma collection '{collection_name}' in '{CHROMA_STORAGE_PATH}'.\n")
+
+    def add_batch(self, doc_ids: List[str], contents: List[str], embeddings: List[List[float]], metadatas: List[Dict]):
+        """Add multiple documents at once for better performance"""
+        try:
+            self.collection.add(
+                ids=doc_ids,
+                documents=contents,
+                embeddings=embeddings,
+                metadatas=metadatas
+            )
+            return True
+        except Exception as e:
+            print(f"Error adding batch: {e}")
+            return False
 
     def add(self, doc_id: str, content: str, embedding: List[float], metadata: Dict):
         self.collection.add(
@@ -81,7 +95,6 @@ class SimpleVectorStore:
 
 
 def files_within_depth(root: Path) -> List[Path]:
-    
     root = root.resolve()
     print(f"\n📁 SCANNING: {root}\n")
     
@@ -93,23 +106,19 @@ def files_within_depth(root: Path) -> List[Path]:
     extensions = {}
     
     for dirpath, dirnames, filenames in os.walk(root):
-        
         dirnames[:] = [d for d in dirnames if d not in BLACKLIST_FOLDERS]
         
-       
         current_dir_name = Path(dirpath).name
         if current_dir_name in BLACKLIST_FOLDERS:
              continue
         
         for filename in filenames:
-          
             if filename.startswith("."):
                 continue
             
             filepath = Path(dirpath) / filename
             results.append(filepath)
-
-           
+            
             ext = filepath.suffix.lower() if filepath.suffix else "[no extension]"
             extensions[ext] = extensions.get(ext, 0) + 1
     
@@ -224,6 +233,12 @@ class WorkspaceIndexer:
         print("INDEXING FILES")
         print("=" * 60 + "\n")
 
+        batch_ids = []
+        batch_contents = []
+        batch_embeddings = []
+        batch_metadatas = []
+        batch_size = 50
+
         for file_path in all_files:
             ext = file_path.suffix.lower()
             
@@ -239,7 +254,6 @@ class WorkspaceIndexer:
                 print(f"⊘ Skipping {file_path.name} (too large: {size/1024/1024:.1f} MB)")
                 continue
 
-           
             if ext == ".pdf":
                 if not HAS_PDF:
                      print(f"⊘ Skipping {file_path.name} (PDF parsing library not installed)")
@@ -296,16 +310,28 @@ class WorkspaceIndexer:
                     print(f"❌ Embedding error for {doc_id}: {e}")
                     continue
 
-                try:
-                    self.vector_store.add(doc_id=doc_id, content=chunk_text_clean, embedding=emb, metadata=metadata)
-                except Exception as e:
-                    print(f"❌ Vector store error for {doc_id}: {e}")
-                    continue
+                # Add to batch
+                batch_ids.append(doc_id)
+                batch_contents.append(chunk_text_clean)
+                batch_embeddings.append(emb)
+                batch_metadatas.append(metadata)
 
-                chunk_count += 1
+                # Flush batch when it reaches batch_size
+                if len(batch_ids) >= batch_size:
+                    self.vector_store.add_batch(batch_ids, batch_contents, batch_embeddings, batch_metadatas)
+                    chunk_count += len(batch_ids)
+                    batch_ids = []
+                    batch_contents = []
+                    batch_embeddings = []
+                    batch_metadatas = []
 
             file_count += 1
             print(f"✓ Indexed: {rel_path} ({len(chunks)} chunks)")
+
+        # Flush remaining batch
+        if batch_ids:
+            self.vector_store.add_batch(batch_ids, batch_contents, batch_embeddings, batch_metadatas)
+            chunk_count += len(batch_ids)
 
         elapsed = time.time() - start_time
         print("\n" + "="*60)
@@ -359,17 +385,4 @@ if __name__ == "__main__":
     indexer = WorkspaceIndexer(str(root), embeddings, vector_store)
 
     stats = indexer.index()
-
-    # Search example
-    searcher = WorkspaceSearcher(embeddings, vector_store)
-    query = "security token logic"
-    print(f"🔍 Searching for: '{query}'\n")
-    hits = searcher.search(query, limit=5)
-    if not hits:
-        print("❌ No hits found.")
-    else:
-        for h in hits:
-            print(f"Rank {h['rank']}: {h['filename']} (project: {h['project_name']})")
-            print(f"Path: {h['file_path']}")
-            print(f"Relevance: {h['relevance']}")
-            print(f"Snippet:\n{h['snippet'][:300]}\n")
+    print(f"Indexing Stats: {stats}")
