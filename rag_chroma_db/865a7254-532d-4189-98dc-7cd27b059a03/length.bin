@@ -1,1 +1,14 @@
-invalid type: string "function analyze() {\n    if (!previewUrl || isAnalyzing) return\n    setIsAnalyzing(true)\n\n    // Simulate analysis; replace with real API call\n    setTimeout(() => {\n      // Lightweight deterministic-ish score based on file size if available\n      const base = file && file.size ? file.size % 100 : Math.floor(Math.random() * 100)\n button {\n    width: 80px !important;
+def list_all_files_in_nested_folders(root_dir):
+   
+    file_paths = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        for filename in filenames:
+            full_path = os.path.join(dirpath, filename)
+            file_paths.append(full_path)
+    return file_paths
+
+
+all_files = list_all_files_in_nested_folders(selected_folder)
+
+for file_path in all_files:
+    print(file_path)\"

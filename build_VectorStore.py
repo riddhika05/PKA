@@ -54,21 +54,40 @@ class SimpleEmbeddings:
 
 
 class SimpleVectorStore:
-    def __init__(self, collection_name: str = CHROMA_COLLECTION_NAME, reset: bool = True):
+    def __init__(self, collection_name: str = CHROMA_COLLECTION_NAME, reset: bool = False):
+        """
+        Initialize vector store connection.
+        
+        Args:
+            collection_name: Name of the ChromaDB collection
+            reset: If True, deletes existing collection and creates new one.
+                   DEFAULT IS NOW FALSE - preserves existing data for incremental indexing
+        """
         self.client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
         
         if reset:
             try:
                 self.client.delete_collection(name=collection_name)
-                print(f"Deleted old Chroma collection '{collection_name}'.")
+                print(f"🗑️  Deleted old Chroma collection '{collection_name}'.")
             except Exception:
-                pass 
-        
-        self.collection = self.client.create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-        print(f"Created new Chroma collection '{collection_name}' in '{CHROMA_STORAGE_PATH}'.\n")
+                pass
+            
+            self.collection = self.client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            print(f"✅ Created new Chroma collection '{collection_name}' in '{CHROMA_STORAGE_PATH}'.\n")
+        else:
+            # Try to get existing collection, create if doesn't exist
+            try:
+                self.collection = self.client.get_collection(name=collection_name)
+                print(f"✅ Connected to existing collection '{collection_name}'.\n")
+            except Exception:
+                self.collection = self.client.create_collection(
+                    name=collection_name,
+                    metadata={"hnsw:space": "cosine"}
+                )
+                print(f"✅ Created new collection '{collection_name}' (didn't exist).\n")
 
     def add_batch(self, doc_ids: List[str], contents: List[str], embeddings: List[List[float]], metadatas: List[Dict]):
         """Add multiple documents at once for better performance"""
@@ -407,19 +426,21 @@ class WorkspaceSearcher:
 
 if __name__ == "__main__":
     print("\n" + "="*60)
-    print("VECTOR STORE BUILDER - OPTIMIZED FOR PHI3:MINI")
+    print("VECTOR STORE BUILDER - INCREMENTAL INDEXING MODE")
     print("="*60)
     print(f"Chunk size: {CHUNK_SIZE_CHARS} chars (balanced for code)")
     print(f"Chunk overlap: {CHUNK_OVERLAP} chars")
-    print(f"Target: Complete code blocks for Phi3's 4K context")
+    print(f"Mode: ADDS to existing collection (no deletion)")
     print("="*60 + "\n")
     
     root = Path(WORKSPACE_PATH)
     embeddings = SimpleEmbeddings(model_name="all-MiniLM-L6-v2")
-    vector_store = SimpleVectorStore(collection_name=CHROMA_COLLECTION_NAME)
+    
+    # reset=False means it WON'T delete existing collection
+    vector_store = SimpleVectorStore(collection_name=CHROMA_COLLECTION_NAME, reset=False)
     indexer = WorkspaceIndexer(str(root), embeddings, vector_store)
 
     stats = indexer.index()
     print(f"\n✅ Indexing Stats: {stats}")
-    print(f"✅ Vector store optimized for Phi3:mini (4K context, code-focused)")
-    print(f"✅ Run main.py to start querying with Phi3:mini\n")
+    print(f"✅ Collection preserved - new files ADDED to existing index")
+    print(f"✅ Run main.py to start querying\n")

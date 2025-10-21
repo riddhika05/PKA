@@ -1,31 +1,38 @@
 import os
 import json
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from typing import List, Optional
 import requests
 from pathlib import Path
+import time
 
 from build_VectorStore import (
     SimpleEmbeddings, 
     WorkspaceSearcher,
+    WorkspaceIndexer,
+    SimpleVectorStore,
     CHROMA_COLLECTION_NAME,
-    CHROMA_STORAGE_PATH
+    CHROMA_STORAGE_PATH,
+    WHITELIST_EXTENSIONS,
+    chunk_code_by_functions,
+    CHUNK_SIZE_CHARS,
+    CHUNK_OVERLAP
 )
 import chromadb
 
 # CONFIG
 WORKSPACE_NAME = "MyRAG_Knowledge_Base"
 WORKSPACE_DRIVE = "C:"
+WORKSPACE_PATH = os.path.join(WORKSPACE_DRIVE, os.sep, WORKSPACE_NAME)
 
-# Phi3:mini - Better for code understanding (UPGRADED FROM TINYLLAMA)
+# Phi3:mini configuration
 MISTRAL_API_URL = "http://localhost:11434/v1"
-MISTRAL_MODEL = "phi3:mini"  # Changed from tinyllama - better quality
+MISTRAL_MODEL = "phi3:mini"
 
-# Phi3:mini has 4K context window (2x TinyLlama)
-MAX_CONTEXT_CHUNKS = 3  # Increased from 2
-MAX_SNIPPET_CHARS = 600  # Increased from 300 for better code context
-MAX_RESPONSE_TOKENS = 800  # Increased from 300 for full code blocks
+MAX_CONTEXT_CHUNKS = 3
+MAX_SNIPPET_CHARS = 600
+MAX_RESPONSE_TOKENS = 800
 
 # CREATE APP
 app = FastAPI()
@@ -39,65 +46,180 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize RAG components (lazy load)
+# Global RAG components
 _embeddings = None
+_collection = None
 _searcher = None
 
-def get_rag_components():
-    """Lazy load RAG components - connects to existing DB"""
-    global _embeddings, _searcher
+
+def get_or_create_collection():
+    """Get existing collection or create new one if doesn't exist"""
+    global _embeddings, _collection, _searcher
     
     if _embeddings is None:
         _embeddings = SimpleEmbeddings(model_name="all-MiniLM-L6-v2")
-        
-        # Connect to existing Chroma collection (don't create/delete)
+    
+    if _collection is None:
         client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
         try:
-            collection = client.get_collection(name=CHROMA_COLLECTION_NAME)
-            print(f"Connected to existing collection: {CHROMA_COLLECTION_NAME}")
-        except Exception as e:
-            print(f"Warning: Collection not found. Run build_VectorStore.py first. Error: {e}")
-            # Create empty one if it doesn't exist
-            collection = client.create_collection(name=CHROMA_COLLECTION_NAME)
-        
-        # Create searcher with existing collection
+            _collection = client.get_collection(name=CHROMA_COLLECTION_NAME)
+            print(f"✅ Connected to existing collection: {CHROMA_COLLECTION_NAME}")
+        except Exception:
+            _collection = client.create_collection(
+                name=CHROMA_COLLECTION_NAME,
+                metadata={"hnsw:space": "cosine"}
+            )
+            print(f"✅ Created new collection: {CHROMA_COLLECTION_NAME}")
+    
+    if _searcher is None:
         class ExistingVectorStore:
             def __init__(self, collection):
                 self.collection = collection
             
             def query(self, query_embedding: List[float], n_results: int = 5):
                 return self.collection.query(query_embeddings=[query_embedding], n_results=n_results)
+            
+            def add_batch(self, doc_ids, contents, embeddings, metadatas):
+                self.collection.add(ids=doc_ids, documents=contents, embeddings=embeddings, metadatas=metadatas)
         
-        vector_store = ExistingVectorStore(collection)
+        vector_store = ExistingVectorStore(_collection)
         _searcher = WorkspaceSearcher(_embeddings, vector_store)
     
-    return _embeddings, _searcher
+    return _embeddings, _collection, _searcher
+
+
+def index_single_file(file_path: Path, embeddings, collection) -> dict:
+    """Index a single file and add its chunks to the collection"""
+    ext = file_path.suffix.lower()
+    
+    if ext not in WHITELIST_EXTENSIONS:
+        return {"status": "skipped", "reason": "file type not whitelisted"}
+    
+    try:
+        size = file_path.stat().st_size
+        if size > 2_000_000:  # 2MB limit
+            return {"status": "skipped", "reason": "file too large"}
+        
+        # Read file content
+        if ext == ".pdf":
+            try:
+                import PyPDF2
+                with open(file_path, 'rb') as f:
+                    pdf_reader = PyPDF2.PdfReader(f)
+                    text = ""
+                    for page in pdf_reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text += page_text + "\n"
+            except Exception as e:
+                return {"status": "error", "reason": f"PDF read error: {str(e)}"}
+        else:
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception as e:
+                return {"status": "error", "reason": f"File read error: {str(e)}"}
+        
+        if not text.strip():
+            return {"status": "skipped", "reason": "empty file"}
+        
+        # Chunk the text
+        chunks = chunk_code_by_functions(text, ext, max_chunk_chars=CHUNK_SIZE_CHARS, overlap=CHUNK_OVERLAP)
+        
+        # Prepare batch data
+        batch_ids = []
+        batch_contents = []
+        batch_embeddings = []
+        batch_metadatas = []
+        
+        abs_path = str(file_path.resolve())
+        
+        for idx, (chunk_text, start_char, end_char) in enumerate(chunks):
+            chunk_text_clean = chunk_text.strip()
+            if not chunk_text_clean:
+                continue
+            
+            metadata = {
+                "filename": file_path.name,
+                "file_path": str(file_path.relative_to(WORKSPACE_PATH)) if WORKSPACE_PATH in str(file_path) else str(file_path),
+                "absolute_path": abs_path,
+                "project_name": file_path.parts[-2] if len(file_path.parts) > 1 else "root",
+                "file_type": ext,
+                "file_size": int(size),
+                "chunk_index": int(idx),
+                "chunk_char_start": int(start_char),
+                "chunk_char_end": int(end_char),
+                "chunk_size": len(chunk_text_clean)
+            }
+            
+            doc_id = f"{abs_path}::chunk_{idx}"
+            
+            try:
+                emb = embeddings.embed(chunk_text_clean)
+            except Exception as e:
+                continue
+            
+            batch_ids.append(doc_id)
+            batch_contents.append(chunk_text_clean)
+            batch_embeddings.append(emb)
+            batch_metadatas.append(metadata)
+        
+        # Add to collection
+        if batch_ids:
+            collection.add(
+                ids=batch_ids,
+                documents=batch_contents,
+                embeddings=batch_embeddings,
+                metadatas=batch_metadatas
+            )
+        
+        return {
+            "status": "success",
+            "chunks_added": len(batch_ids),
+            "file_size": size
+        }
+    
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
+def delete_file_from_collection(file_path: Path, collection) -> dict:
+    """Delete all chunks of a file from the collection"""
+    abs_path = str(file_path.resolve())
+    
+    try:
+        # Get all document IDs for this file
+        results = collection.get()
+        ids_to_delete = [id for id in results['ids'] if id.startswith(f"{abs_path}::")]
+        
+        if ids_to_delete:
+            collection.delete(ids=ids_to_delete)
+            return {"status": "success", "chunks_deleted": len(ids_to_delete)}
+        else:
+            return {"status": "success", "chunks_deleted": 0, "message": "File not found in collection"}
+    
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
 
 
 def query_mistral(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS) -> str:
-    """
-    Query Phi3:mini locally via Ollama
-    Better for code understanding and generation
-    """
+    """Query Phi3:mini locally via Ollama"""
     try:
         response = requests.post(
             f"{MISTRAL_API_URL}/chat/completions",
             json={
                 "model": MISTRAL_MODEL,
-                "messages": [
-                    {"role": "user", "content": prompt}
-                ],
-                "temperature": 0.3,  # Lower for more focused code generation
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
                 "max_tokens": max_tokens,
                 "top_p": 0.9,
                 "stream": False,
                 "options": {
-                    "num_ctx": 4096,  # Phi3's context window
+                    "num_ctx": 4096,
                     "num_thread": 8,
                     "num_predict": max_tokens,
                 }
             },
-            timeout=300,  # Phi3 is slower than TinyLlama
+            timeout=300,
             stream=False
         )
         
@@ -109,7 +231,6 @@ def query_mistral(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS) -> str:
         
         result = response.json()
         
-        # Extract content from response
         if 'choices' in result and len(result['choices']) > 0:
             content = result['choices'][0].get('message', {}).get('content', '')
             return content.strip() if content else "No response generated"
@@ -122,119 +243,279 @@ def query_mistral(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS) -> str:
             detail="Cannot connect to Phi3. Ensure Ollama is running with: ollama run phi3:mini"
         )
     except requests.exceptions.Timeout:
-        raise HTTPException(
-            status_code=504,
-            detail="Request timed out. Phi3 took too long to respond."
-        )
+        raise HTTPException(status_code=504, detail="Request timed out.")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Phi3 error: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Phi3 error: {str(e)}")
 
 
-# ENDPOINTS
+# ==================== API ENDPOINTS ====================
 
 @app.post("/setup_workspace")
-def setup_workspace(workspace_name=WORKSPACE_NAME, drive=WORKSPACE_DRIVE):
-    workspace_path = os.path.join(drive, os.sep, workspace_name)
-
-    if os.path.exists(workspace_path):
-        return {"status": "success", "message": f"Workspace already exists at {workspace_path}"}
+def setup_workspace():
+    """Create workspace directory if it doesn't exist"""
+    if os.path.exists(WORKSPACE_PATH):
+        return {"status": "success", "message": f"Workspace already exists at {WORKSPACE_PATH}"}
     
     try:
-        os.makedirs(workspace_path, exist_ok=True)
-        return {"status": "success", "message": f"Workspace created at {workspace_path}"}
-    
+        os.makedirs(WORKSPACE_PATH, exist_ok=True)
+        return {"status": "success", "message": f"Workspace created at {WORKSPACE_PATH}"}
     except PermissionError:
-        raise HTTPException(
-            status_code=403, 
-            detail=f"Permission denied. Could not create folder at: {workspace_path}"
-        )
+        raise HTTPException(status_code=403, detail=f"Permission denied: {WORKSPACE_PATH}")
     except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"An unexpected error occurred: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
-@app.post("/upload_files")
-async def upload_files(files: List[UploadFile] = File(...)):
-    
+@app.post("/upload_and_index")
+async def upload_and_index(
+    files: List[UploadFile] = File(...),
+    file_paths: Optional[str] = Form(None)
+):
+    """
+    Upload files and automatically index them into the vector store.
+    This is the main endpoint for adding new files.
+    Supports both individual files and folder uploads with structure preservation.
+    """
     try:
-        workspace_path = os.path.join(WORKSPACE_DRIVE, os.sep, WORKSPACE_NAME)
+        # Ensure workspace exists
+        if not os.path.exists(WORKSPACE_PATH):
+            os.makedirs(WORKSPACE_PATH, exist_ok=True)
         
-        if not os.path.exists(workspace_path):
-            os.makedirs(workspace_path, exist_ok=True)
+        # Get or create collection
+        embeddings, collection, searcher = get_or_create_collection()
         
-        uploaded_files = []
+        # Parse file paths if provided (for folder uploads)
+        paths_list = []
+        if file_paths:
+            try:
+                paths_list = json.loads(file_paths)
+                print(f"📂 Folder upload detected with {len(paths_list)} paths")
+            except Exception as e:
+                print(f"⚠️ Could not parse file_paths: {e}")
+                paths_list = []
         
-        for file in files:
-            if file.filename:
-                safe_filename = file.filename.replace(" ", "_")
-                file_path = os.path.join(workspace_path, safe_filename)
-                
-                parent_dir = os.path.dirname(file_path)
-                if parent_dir and not os.path.exists(parent_dir):
-                    os.makedirs(parent_dir, exist_ok=True)
-                
-                with open(file_path, "wb") as buffer:
-                    content = await file.read()
-                    buffer.write(content)
-                
-                uploaded_files.append({
-                    "filename": file.filename,
-                    "saved_as": safe_filename,
-                    "size": len(content),
-                    "path": file_path
-                })
+        results = []
+        total_chunks = 0
+        
+        for idx, file in enumerate(files):
+            if not file.filename:
+                continue
+            
+            # Use relative path if available (folder upload), otherwise just filename
+            if idx < len(paths_list) and paths_list[idx]:
+                relative_path = paths_list[idx].replace(" ", "_")
+                print(f"📁 Using folder path: {relative_path}")
+            else:
+                relative_path = file.filename.replace(" ", "_")
+                print(f"📄 Using filename: {relative_path}")
+            
+            # Create full path with subdirectories
+            file_path = Path(WORKSPACE_PATH) / relative_path
+            
+            # Create parent directories if needed
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Save file
+            with open(file_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
+            
+            print(f"💾 Saved: {file_path}")
+            
+            # Index the file
+            index_result = index_single_file(file_path, embeddings, collection)
+            
+            results.append({
+                "filename": file.filename,
+                "saved_as": relative_path,
+                "size": len(content),
+                "path": str(file_path),
+                "indexing": index_result
+            })
+            
+            if index_result["status"] == "success":
+                total_chunks += index_result.get("chunks_added", 0)
         
         return {
             "status": "success",
-            "message": f"Successfully uploaded {len(uploaded_files)} file(s)",
-            "uploaded_files": uploaded_files,
-            "workspace_path": workspace_path
+            "message": f"Uploaded and indexed {len(results)} file(s)",
+            "total_chunks_added": total_chunks,
+            "files": results,
+            "workspace_path": WORKSPACE_PATH
         }
-        
-    except PermissionError:
-        raise HTTPException(
-            status_code=403,
-            detail="Permission denied. Could not write to workspace directory."
-        )
+    
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Upload error: {str(e)}"
+        print(f"❌ Upload error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
+
+
+@app.post("/index_workspace")
+def index_workspace():
+    """
+    Index all files in the workspace directory.
+    Use this to re-index existing files or after manual file additions.
+    """
+    try:
+        workspace = Path(WORKSPACE_PATH)
+        if not workspace.exists():
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        
+        embeddings, collection, searcher = get_or_create_collection()
+        
+        # Get all files
+        all_files = []
+        for root, dirs, files in os.walk(workspace):
+            # Skip blacklisted folders
+            dirs[:] = [d for d in dirs if d not in {"node_modules", "__pycache__", "venv", ".git"}]
+            
+            for file in files:
+                if not file.startswith("."):
+                    all_files.append(Path(root) / file)
+        
+        results = []
+        total_chunks = 0
+        
+        for file_path in all_files:
+            index_result = index_single_file(file_path, embeddings, collection)
+            
+            if index_result["status"] == "success":
+                total_chunks += index_result.get("chunks_added", 0)
+            
+            results.append({
+                "file": str(file_path.relative_to(workspace)),
+                "result": index_result
+            })
+        
+        return {
+            "status": "success",
+            "message": f"Indexed {len(all_files)} files",
+            "total_chunks_added": total_chunks,
+            "files": results
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Indexing error: {str(e)}")
+
+
+@app.delete("/delete_file")
+def delete_file(file_path: str):
+    """
+    Delete a file from both filesystem and vector store.
+    file_path: relative path from workspace root (e.g., "script.py" or "folder/file.py")
+    """
+    try:
+        embeddings, collection, searcher = get_or_create_collection()
+        
+        full_path = Path(WORKSPACE_PATH) / file_path
+        
+        if not full_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Delete from vector store first
+        delete_result = delete_file_from_collection(full_path, collection)
+        
+        # Delete from filesystem
+        full_path.unlink()
+        
+        return {
+            "status": "success",
+            "message": f"Deleted {file_path}",
+            "vector_store": delete_result,
+            "file_deleted": True
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
+
+
+@app.post("/reset_collection")
+def reset_collection():
+    """
+    Delete and recreate the entire collection.
+    WARNING: This removes all indexed data!
+    """
+    global _collection, _searcher
+    
+    try:
+        client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
+        
+        # Delete existing collection
+        try:
+            client.delete_collection(name=CHROMA_COLLECTION_NAME)
+            print(f"🗑️ Deleted collection: {CHROMA_COLLECTION_NAME}")
+        except Exception:
+            pass
+        
+        # Create new collection
+        _collection = client.create_collection(
+            name=CHROMA_COLLECTION_NAME,
+            metadata={"hnsw:space": "cosine"}
         )
+        
+        # Reset searcher
+        _searcher = None
+        
+        return {
+            "status": "success",
+            "message": "Collection reset successfully",
+            "collection_name": CHROMA_COLLECTION_NAME
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reset error: {str(e)}")
+
+
+@app.get("/collection_stats")
+def collection_stats():
+    """Get statistics about the current collection"""
+    try:
+        embeddings, collection, searcher = get_or_create_collection()
+        
+        # Get all documents
+        results = collection.get()
+        total_chunks = len(results['ids'])
+        
+        # Count unique files
+        unique_files = set()
+        for metadata in results.get('metadatas', []):
+            if metadata and 'absolute_path' in metadata:
+                unique_files.add(metadata['absolute_path'])
+        
+        # File type distribution
+        file_types = {}
+        for metadata in results.get('metadatas', []):
+            if metadata and 'file_type' in metadata:
+                ft = metadata['file_type']
+                file_types[ft] = file_types.get(ft, 0) + 1
+        
+        return {
+            "status": "success",
+            "collection_name": CHROMA_COLLECTION_NAME,
+            "total_chunks": total_chunks,
+            "unique_files": len(unique_files),
+            "file_types": file_types,
+            "storage_path": CHROMA_STORAGE_PATH
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Stats error: {str(e)}")
 
 
 @app.post("/ask")
 async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_filter: str = None):
-    """
-    Ask a question about the indexed codebase using RAG with Phi3:mini.
-    
-    OPTIMIZED FOR CODE GENERATION:
-    - Better prompt engineering for code extraction
-    - Larger context window (4K tokens vs TinyLlama's 2K)
-    - Higher quality model for understanding assignments
-    
-    Parameters:
-    - question: The question to ask
-    - context_limit: Number of context chunks to retrieve (default: 3, max: 5)
-    - project_filter: Optional filter to search only in a specific project
-    """
+    """Ask a question about the indexed codebase using RAG with Phi3:mini"""
     
     if not question or not question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     
-    # Enforce maximum context limit
     if context_limit > 5:
         context_limit = 5
-        print(f"⚠️ Context limit capped at 5")
     
     try:
-        # Get RAG components
-        _, searcher = get_rag_components()
+        embeddings, collection, searcher = get_or_create_collection()
         
         # Search for relevant context
         search_results = searcher.search(
@@ -247,18 +528,17 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
             return {
                 "status": "success",
                 "question": question,
-                "answer": "No relevant context found in the knowledge base. Please ensure files have been indexed.",
+                "answer": "No relevant context found in the knowledge base.",
                 "context_used": 0,
                 "sources": [],
                 "model": MISTRAL_MODEL
             }
         
-        # Build context from search results
+        # Build context
         context_chunks = []
         sources = []
         
         for result in search_results:
-            # Use larger snippets for better code context
             snippet = result["snippet"][:MAX_SNIPPET_CHARS]
             if len(result["snippet"]) > MAX_SNIPPET_CHARS:
                 snippet += "..."
@@ -273,8 +553,7 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
         
         context = "\n\n---SECTION---\n\n".join(context_chunks)
         
-        # IMPROVED PROMPT for code generation
-        # Detect if question is asking for code
+        # Detect if asking for code
         asking_for_code = any(keyword in question.lower() for keyword in [
             'code', 'implement', 'write', 'program', 'function', 'class', 
             'script', 'assignment', 'solution', 'algorithm'
@@ -308,11 +587,7 @@ Provide a clear, detailed answer. Include code snippets if relevant using markdo
 
 ANSWER:"""
         
-        # Check prompt size
-        estimated_tokens = len(prompt) // 4
-        print(f"📊 Estimated prompt tokens: {estimated_tokens}")
-        
-        # Query Phi3:mini
+        # Query LLM
         answer = query_mistral(prompt, max_tokens=MAX_RESPONSE_TOKENS)
         
         return {
@@ -321,17 +596,13 @@ ANSWER:"""
             "answer": answer,
             "context_used": len(search_results),
             "sources": sources,
-            "model": MISTRAL_MODEL,
-            "estimated_prompt_tokens": estimated_tokens
+            "model": MISTRAL_MODEL
         }
     
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error processing question: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @app.get("/health")
@@ -339,22 +610,40 @@ def health():
     """Health check endpoint"""
     return {
         "status": "ok", 
-        "service": "RAG API with Phi3:mini (Code Optimized)",
-        "model": MISTRAL_MODEL,
-        "max_context_chunks": MAX_CONTEXT_CHUNKS,
-        "max_snippet_chars": MAX_SNIPPET_CHARS
+        "service": "RAG API with Dynamic Indexing",
+        "model": MISTRAL_MODEL
     }
 
 
-@app.get("/model_info")
-def model_info():
-    """Get current model configuration"""
-    return {
-        "model": MISTRAL_MODEL,
-        "context_window": "~4096 tokens",
-        "max_context_chunks": MAX_CONTEXT_CHUNKS,
-        "max_snippet_chars": MAX_SNIPPET_CHARS,
-        "max_response_tokens": MAX_RESPONSE_TOKENS,
-        "optimized_for": "Code generation and understanding",
-        "expected_response_time": "15-30 seconds"
-    }
+@app.get("/list_files")
+def list_files():
+    """List all files in the workspace"""
+    try:
+        workspace = Path(WORKSPACE_PATH)
+        if not workspace.exists():
+            return {"status": "success", "files": [], "message": "Workspace not found"}
+        
+        files = []
+        for root, dirs, filenames in os.walk(workspace):
+            dirs[:] = [d for d in dirs if d not in {"node_modules", "__pycache__", "venv", ".git"}]
+            
+            for filename in filenames:
+                if not filename.startswith("."):
+                    file_path = Path(root) / filename
+                    rel_path = file_path.relative_to(workspace)
+                    files.append({
+                        "path": str(rel_path),
+                        "name": filename,
+                        "size": file_path.stat().st_size,
+                        "extension": file_path.suffix
+                    })
+        
+        return {
+            "status": "success",
+            "workspace": WORKSPACE_PATH,
+            "file_count": len(files),
+            "files": files
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
