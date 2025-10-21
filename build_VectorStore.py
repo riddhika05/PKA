@@ -24,7 +24,7 @@ WHITELIST_EXTENSIONS = {
     ".py", ".cs", ".js", ".ts", ".java", ".go",
     ".html", ".css", ".md", ".txt", ".json",
     ".csproj", ".sln", ".cshtml", ".config", ".xml",
-    ".pdf", ".jsx", ".tsx", ".md", ".ppt", ".pptx"
+    ".pdf", ".jsx", ".tsx", ".md", ".ppt", ".pptx",".cpp",".c"
 }
 
 BLACKLIST_FOLDERS = {
