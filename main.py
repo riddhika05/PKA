@@ -507,30 +507,51 @@ def collection_stats():
 
 @app.post("/ask")
 async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_filter: str = None, stream: bool = False):
-    """Ask a question about the indexed codebase using RAG with Phi3:mini"""
-    
+    """Ask a question about the indexed codebase using RAG with Phi3:mini.
+    Includes logic for detecting and returning file paths for specific file/function queries.
+    """
+
     if not question or not question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
-    
+
     if context_limit > 5:
         context_limit = 5
-    
+
     try:
         embeddings, collection, searcher = get_or_create_collection()
         
+        # --- 1. Intent Detection for File Path Retrieval ---
+        # Checks if the user is explicitly asking for a file/path/source
+        file_retrieval_keywords = [
+            'file', 'path', 'source', 'location', 'give me', 'containing function', 
+            'function', 'class', 'module', 'script'
+        ]
+        
+        asking_for_code = any(keyword in question.lower() for keyword in [
+            'code', 'implement', 'write', 'program', 'function', 'class', 
+            'script', 'assignment', 'solution', 'algorithm'
+        ])
+        
+        asking_for_filepath_only = any(
+            keyword in question.lower() for keyword in ['file', 'path', 'source', 'location']
+        ) and not asking_for_code
+        
+        # --- 2. Perform RAG Search (Always necessary to find context) ---
         search_results = searcher.search(
             query=question, 
             limit=context_limit, 
             project_filter=project_filter
         )
+        
         print(f"\n--- RAG Search Results for Question: '{question}' ---")
         if not search_results:
             print("No results found.")
         else:
             for i, result in enumerate(search_results):
-                 print(f"[{i+1}] Relevance: {result['relevance']:.4f} | File: {result['file_path']}")
+                print(f"[{i+1}] Relevance: {result['relevance']:.4f} | File: {result['file_path']}")
         print("----------------------------------------------------------")
-            
+
+        # --- 3. Handle No Context Found ---
         if not search_results:
             if stream:
                 async def no_context_stream():
@@ -546,8 +567,29 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
                     "sources": [],
                     "model": MISTRAL_MODEL
                 }
+
+        # --- 4. Handle Explicit File Path Request ---
+        if asking_for_filepath_only:
+            # Get the single most relevant file path
+            most_relevant_result = search_results[0]
+            file_path = most_relevant_result['file_path']
+            
+            # Return the file path directly without calling the LLM
+            return {
+                "status": "success",
+                "question": question,
+                "answer": f"The most relevant file is: `{file_path}`",
+                "context_used": 1,
+                "sources": [{
+                    "filename": most_relevant_result["filename"],
+                    "file_path": file_path,
+                    "project": most_relevant_result["project_name"],
+                    "relevance": most_relevant_result["relevance"]
+                }],
+                "model": MISTRAL_MODEL
+            }
         
-        # Build context
+        # --- 5. Prepare Context for LLM (Standard RAG) ---
         context_chunks = []
         sources = []
         
@@ -566,11 +608,7 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
         
         context = "\n\n---SECTION---\n\n".join(context_chunks)
         
-        asking_for_code = any(keyword in question.lower() for keyword in [
-            'code', 'implement', 'write', 'program', 'function', 'class', 
-            'script', 'assignment', 'solution', 'algorithm'
-        ])
-        
+        # Determine prompt type (Code Generation vs. General Answer)
         if asking_for_code:
             prompt = f"""You are a code assistant. Extract and provide the complete code from the context below.
 
@@ -588,8 +626,8 @@ INSTRUCTIONS:
 
 ANSWER:"""
         else:
-            prompt = f"""Answer the following question based on the provided context.If context is insufficient say so.
-
+            prompt = f"""Answer the following question based on the provided context. If context is insufficient say so.
+            
 CONTEXT:
 {context}
 
@@ -599,6 +637,7 @@ Provide a clear, detailed answer. Include code snippets if relevant using markdo
 
 ANSWER:"""
         
+        # --- 6. LLM Response ---
         # Streaming response
         if stream:
             async def generate_stream():
