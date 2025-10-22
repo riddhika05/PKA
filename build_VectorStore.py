@@ -24,7 +24,7 @@ WHITELIST_EXTENSIONS = {
     ".py", ".cs", ".js", ".ts", ".java", ".go",
     ".html", ".css", ".md", ".txt", ".json",
     ".csproj", ".sln", ".cshtml", ".config", ".xml",
-    ".pdf" ,".jsx",".tsx",".java",".go",".cs",".cshtml",".md","ppt","pptx"
+    ".pdf", ".jsx", ".tsx", ".md", ".ppt", ".pptx",".cpp",".c"
 }
 
 BLACKLIST_FOLDERS = {
@@ -33,9 +33,8 @@ BLACKLIST_FOLDERS = {
     "bin", "obj", "packages", "Migrations" 
 }
 MAX_FILE_SIZE_BYTES = 2_000_000
-
-CHUNK_SIZE_CHARS = 2000
-CHUNK_OVERLAP = 200
+CHUNK_SIZE_CHARS = 1500  
+CHUNK_OVERLAP = 200       
 
 CHROMA_COLLECTION_NAME = "documents"
 CHROMA_STORAGE_PATH = "rag_chroma_db"
@@ -52,24 +51,36 @@ class SimpleEmbeddings:
 
 
 class SimpleVectorStore:
-    def __init__(self, collection_name: str = CHROMA_COLLECTION_NAME, reset: bool = True):
+    def __init__(self, collection_name: str = CHROMA_COLLECTION_NAME, reset: bool = False):
+       
         self.client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
         
         if reset:
             try:
                 self.client.delete_collection(name=collection_name)
-                print(f"Deleted old Chroma collection '{collection_name}'.")
+                print(f"🗑️  Deleted old Chroma collection '{collection_name}'.")
             except Exception:
-                pass 
-        
-        self.collection = self.client.create_collection(
-            name=collection_name,
-            metadata={"hnsw:space": "cosine"}
-        )
-        print(f"Created new Chroma collection '{collection_name}' in '{CHROMA_STORAGE_PATH}'.\n")
+                pass
+            
+            self.collection = self.client.create_collection(
+                name=collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            print(f"✅ Created new Chroma collection '{collection_name}' in '{CHROMA_STORAGE_PATH}'.\n")
+        else:
+           
+            try:
+                self.collection = self.client.get_collection(name=collection_name)
+                print(f"✅ Connected to existing collection '{collection_name}'.\n")
+            except Exception:
+                self.collection = self.client.create_collection(
+                    name=collection_name,
+                    metadata={"hnsw:space": "cosine"}
+                )
+                print(f"✅ Created new collection '{collection_name}' (didn't exist).\n")
 
     def add_batch(self, doc_ids: List[str], contents: List[str], embeddings: List[List[float]], metadatas: List[Dict]):
-        """Add multiple documents at once for better performance"""
+       
         try:
             self.collection.add(
                 ids=doc_ids,
@@ -96,7 +107,7 @@ class SimpleVectorStore:
 
 def files_within_depth(root: Path) -> List[Path]:
     root = root.resolve()
-    print(f"\n📁 SCANNING: {root}\n")
+    print(f"\n🔍 SCANNING: {root}\n")
     
     if not root.exists():
         print(f"❌ Root path does not exist!")
@@ -122,7 +133,7 @@ def files_within_depth(root: Path) -> List[Path]:
             ext = filepath.suffix.lower() if filepath.suffix else "[no extension]"
             extensions[ext] = extensions.get(ext, 0) + 1
     
-    print(f"✓ Found {len(results)} total files from os.walk()\n")
+    print(f"✅ Found {len(results)} total files from os.walk()\n")
     
     print("FILE TYPES FOUND:")
     for ext, count in sorted(extensions.items(), key=lambda x: -x[1]):
@@ -134,6 +145,7 @@ def files_within_depth(root: Path) -> List[Path]:
 
 
 def chunk_text_fallback(text: str, chunk_size: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP) -> List[Tuple[str,int,int]]:
+    
     chunks = []
     text_len = len(text)
     start = 0
@@ -158,6 +170,7 @@ FUNCTION_PATTERNS = {
 }
 
 def chunk_code_by_functions(text: str, ext: str, max_chunk_chars: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP) -> List[Tuple[str,int,int]]:
+    
     pattern = FUNCTION_PATTERNS.get(ext)
     if not pattern:
         return chunk_text_fallback(text, max_chunk_chars, overlap)
@@ -181,6 +194,7 @@ def chunk_code_by_functions(text: str, ext: str, max_chunk_chars: int = CHUNK_SI
                 chunks.append((sub, global_s, global_e))
         else:
             chunks.append((chunk_text, s, e))
+    
     
     merged = []
     for chunk, s, e in chunks:
@@ -230,7 +244,8 @@ class WorkspaceIndexer:
         start_time = time.time()
 
         print("=" * 60)
-        print("INDEXING FILES")
+        print("INDEXING FILES (Optimized for Phi3:mini - Code Focus)")
+        print(f"Chunk size: {CHUNK_SIZE_CHARS} chars (balanced for code blocks)")
         print("=" * 60 + "\n")
 
         batch_ids = []
@@ -266,6 +281,12 @@ class WorkspaceIndexer:
                             page_text = page.extract_text()
                             if page_text:
                                 text += page_text + "\n"
+                    
+                    # Log PDF content for debugging
+                    print(f"📄 PDF extracted: {file_path.name} ({len(text)} chars)")
+                    if len(text) > 100:
+                        print(f"   First 100 chars: {text[:100]}")
+                        
                 except Exception as e:
                     print(f"❌ Error reading PDF {file_path.name}: {e}")
                     continue
@@ -279,6 +300,7 @@ class WorkspaceIndexer:
             if not text.strip():
                 continue
 
+            
             chunks = chunk_code_by_functions(text, ext, max_chunk_chars=CHUNK_SIZE_CHARS, overlap=CHUNK_OVERLAP)
 
             project_name = self.get_project_name(file_path)
@@ -299,7 +321,8 @@ class WorkspaceIndexer:
                     "file_size": size,
                     "chunk_index": idx,
                     "chunk_char_start": int(start_char),
-                    "chunk_char_end": int(end_char)
+                    "chunk_char_end": int(end_char),
+                    "chunk_size": len(chunk_text_clean)
                 }
 
                 doc_id = f"{abs_path}::chunk_{idx}"
@@ -310,13 +333,13 @@ class WorkspaceIndexer:
                     print(f"❌ Embedding error for {doc_id}: {e}")
                     continue
 
-                # Add to batch
+               
                 batch_ids.append(doc_id)
                 batch_contents.append(chunk_text_clean)
                 batch_embeddings.append(emb)
                 batch_metadatas.append(metadata)
 
-                # Flush batch when it reaches batch_size
+              
                 if len(batch_ids) >= batch_size:
                     self.vector_store.add_batch(batch_ids, batch_contents, batch_embeddings, batch_metadatas)
                     chunk_count += len(batch_ids)
@@ -326,9 +349,9 @@ class WorkspaceIndexer:
                     batch_metadatas = []
 
             file_count += 1
-            print(f"✓ Indexed: {rel_path} ({len(chunks)} chunks)")
+            print(f"✅ Indexed: {rel_path} ({len(chunks)} chunks)")
 
-        # Flush remaining batch
+        
         if batch_ids:
             self.vector_store.add_batch(batch_ids, batch_contents, batch_embeddings, batch_metadatas)
             chunk_count += len(batch_ids)
@@ -338,6 +361,7 @@ class WorkspaceIndexer:
         print(f"Indexing complete in {elapsed:.1f}s")
         print(f"Files indexed: {file_count}")
         print(f"Total chunks indexed: {chunk_count}")
+        print(f"Average chunk size: {CHUNK_SIZE_CHARS} chars (optimized for Phi3:mini)")
         print("="*60 + "\n")
         return {"files": file_count, "chunks": chunk_count}
 
@@ -347,6 +371,7 @@ class WorkspaceSearcher:
         self.vector_store = vector_store
 
     def search(self, query: str, limit: int = 5, project_filter: str = None):
+       
         q_emb = self.embeddings.embed(query)
         res = self.vector_store.query(q_emb, n_results=limit * 3)
 
@@ -364,13 +389,17 @@ class WorkspaceSearcher:
                 continue
             doc_content = docs[i] if i < len(docs) else ""
             distance = distances[i] if i < len(distances) else 1.0
+            
+            
+            snippet_length = 600  
             formatted.append({
                 "rank": len(formatted) + 1,
                 "doc_id": doc_id,
                 "filename": md.get("filename"),
                 "file_path": md.get("file_path"),
                 "project_name": md.get("project_name"),
-                "snippet": doc_content[:800] + ("..." if len(doc_content) > 800 else ""),
+                "snippet": doc_content[:snippet_length] + ("..." if len(doc_content) > snippet_length else ""),
+                "full_content": doc_content,  # Include full chunk for code extraction
                 "relevance": round(1 - distance, 4)
             })
             if len(formatted) >= limit:
@@ -379,10 +408,22 @@ class WorkspaceSearcher:
 
 
 if __name__ == "__main__":
+    print("\n" + "="*60)
+    print("VECTOR STORE BUILDER - INCREMENTAL INDEXING MODE")
+    print("="*60)
+    print(f"Chunk size: {CHUNK_SIZE_CHARS} chars (balanced for code)")
+    print(f"Chunk overlap: {CHUNK_OVERLAP} chars")
+    print(f"Mode: ADDS to existing collection (no deletion)")
+    print("="*60 + "\n")
+    
     root = Path(WORKSPACE_PATH)
     embeddings = SimpleEmbeddings(model_name="all-MiniLM-L6-v2")
-    vector_store = SimpleVectorStore(collection_name=CHROMA_COLLECTION_NAME)
+    
+    # reset=False means it WON'T delete existing collection
+    vector_store = SimpleVectorStore(collection_name=CHROMA_COLLECTION_NAME, reset=False)
     indexer = WorkspaceIndexer(str(root), embeddings, vector_store)
 
     stats = indexer.index()
-    print(f"Indexing Stats: {stats}")
+    print(f"\n✅ Indexing Stats: {stats}")
+    print(f"✅ Collection preserved - new files ADDED to existing index")
+    print(f"✅ Run main.py to start querying\n")
