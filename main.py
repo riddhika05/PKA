@@ -33,7 +33,7 @@ MISTRAL_MODEL = "phi3:mini"
 
 MAX_CONTEXT_CHUNKS = 3
 MAX_SNIPPET_CHARS = 600
-MAX_RESPONSE_TOKENS = 800
+MAX_RESPONSE_TOKENS = 2048
 
 # CREATE APP
 app = FastAPI()
@@ -523,7 +523,14 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
             limit=context_limit, 
             project_filter=project_filter
         )
-        
+        print(f"\n--- RAG Search Results for Question: '{question}' ---")
+        if not search_results:
+            print("No results found.")
+        else:
+            for i, result in enumerate(search_results):
+                 print(f"[{i+1}] Relevance: {result['relevance']:.4f} | File: {result['file_path']}")
+        print("----------------------------------------------------------")
+            
         if not search_results:
             if stream:
                 async def no_context_stream():
@@ -581,7 +588,7 @@ INSTRUCTIONS:
 
 ANSWER:"""
         else:
-            prompt = f"""Answer the following question based on the provided context.
+            prompt = f"""Answer the following question based on the provided context.If context is insufficient say so.
 
 CONTEXT:
 {context}
