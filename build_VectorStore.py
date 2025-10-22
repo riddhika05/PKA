@@ -33,11 +33,8 @@ BLACKLIST_FOLDERS = {
     "bin", "obj", "packages", "Migrations" 
 }
 MAX_FILE_SIZE_BYTES = 2_000_000
-
-# OPTIMIZED FOR PHI3:MINI - Balanced chunks for code
-# Phi3 has ~4096 token context window
-CHUNK_SIZE_CHARS = 1500  # Balanced size for code blocks
-CHUNK_OVERLAP = 200       # Good overlap for context continuity
+CHUNK_SIZE_CHARS = 1500  
+CHUNK_OVERLAP = 200       
 
 CHROMA_COLLECTION_NAME = "documents"
 CHROMA_STORAGE_PATH = "rag_chroma_db"
@@ -55,14 +52,7 @@ class SimpleEmbeddings:
 
 class SimpleVectorStore:
     def __init__(self, collection_name: str = CHROMA_COLLECTION_NAME, reset: bool = False):
-        """
-        Initialize vector store connection.
-        
-        Args:
-            collection_name: Name of the ChromaDB collection
-            reset: If True, deletes existing collection and creates new one.
-                   DEFAULT IS NOW FALSE - preserves existing data for incremental indexing
-        """
+       
         self.client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
         
         if reset:
@@ -78,7 +68,7 @@ class SimpleVectorStore:
             )
             print(f"✅ Created new Chroma collection '{collection_name}' in '{CHROMA_STORAGE_PATH}'.\n")
         else:
-            # Try to get existing collection, create if doesn't exist
+           
             try:
                 self.collection = self.client.get_collection(name=collection_name)
                 print(f"✅ Connected to existing collection '{collection_name}'.\n")
@@ -90,7 +80,7 @@ class SimpleVectorStore:
                 print(f"✅ Created new collection '{collection_name}' (didn't exist).\n")
 
     def add_batch(self, doc_ids: List[str], contents: List[str], embeddings: List[List[float]], metadatas: List[Dict]):
-        """Add multiple documents at once for better performance"""
+       
         try:
             self.collection.add(
                 ids=doc_ids,
@@ -155,10 +145,7 @@ def files_within_depth(root: Path) -> List[Path]:
 
 
 def chunk_text_fallback(text: str, chunk_size: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP) -> List[Tuple[str,int,int]]:
-    """
-    OPTIMIZED FOR PHI3:MINI:
-    Balanced chunks that can hold complete code functions/blocks
-    """
+    
     chunks = []
     text_len = len(text)
     start = 0
@@ -183,9 +170,7 @@ FUNCTION_PATTERNS = {
 }
 
 def chunk_code_by_functions(text: str, ext: str, max_chunk_chars: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP) -> List[Tuple[str,int,int]]:
-    """
-    OPTIMIZED FOR PHI3:MINI - Better code block preservation
-    """
+    
     pattern = FUNCTION_PATTERNS.get(ext)
     if not pattern:
         return chunk_text_fallback(text, max_chunk_chars, overlap)
@@ -210,7 +195,7 @@ def chunk_code_by_functions(text: str, ext: str, max_chunk_chars: int = CHUNK_SI
         else:
             chunks.append((chunk_text, s, e))
     
-    # Merge small chunks
+    
     merged = []
     for chunk, s, e in chunks:
         if not merged:
@@ -315,7 +300,7 @@ class WorkspaceIndexer:
             if not text.strip():
                 continue
 
-            # Use optimized chunking
+            
             chunks = chunk_code_by_functions(text, ext, max_chunk_chars=CHUNK_SIZE_CHARS, overlap=CHUNK_OVERLAP)
 
             project_name = self.get_project_name(file_path)
@@ -348,13 +333,13 @@ class WorkspaceIndexer:
                     print(f"❌ Embedding error for {doc_id}: {e}")
                     continue
 
-                # Add to batch
+               
                 batch_ids.append(doc_id)
                 batch_contents.append(chunk_text_clean)
                 batch_embeddings.append(emb)
                 batch_metadatas.append(metadata)
 
-                # Flush batch when it reaches batch_size
+              
                 if len(batch_ids) >= batch_size:
                     self.vector_store.add_batch(batch_ids, batch_contents, batch_embeddings, batch_metadatas)
                     chunk_count += len(batch_ids)
@@ -366,7 +351,7 @@ class WorkspaceIndexer:
             file_count += 1
             print(f"✅ Indexed: {rel_path} ({len(chunks)} chunks)")
 
-        # Flush remaining batch
+        
         if batch_ids:
             self.vector_store.add_batch(batch_ids, batch_contents, batch_embeddings, batch_metadatas)
             chunk_count += len(batch_ids)
@@ -386,9 +371,7 @@ class WorkspaceSearcher:
         self.vector_store = vector_store
 
     def search(self, query: str, limit: int = 5, project_filter: str = None):
-        """
-        OPTIMIZED FOR PHI3:MINI - Returns larger snippets for code context
-        """
+       
         q_emb = self.embeddings.embed(query)
         res = self.vector_store.query(q_emb, n_results=limit * 3)
 
@@ -407,8 +390,8 @@ class WorkspaceSearcher:
             doc_content = docs[i] if i < len(docs) else ""
             distance = distances[i] if i < len(distances) else 1.0
             
-            # Return larger snippets for Phi3:mini (600 chars for better code context)
-            snippet_length = 600  # Increased from 300 for code blocks
+            
+            snippet_length = 600  
             formatted.append({
                 "rank": len(formatted) + 1,
                 "doc_id": doc_id,

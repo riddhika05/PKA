@@ -2,6 +2,7 @@ import os
 import json
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from typing import List, Optional
 import requests
 from pathlib import Path
@@ -201,8 +202,54 @@ def delete_file_from_collection(file_path: Path, collection) -> dict:
         return {"status": "error", "reason": str(e)}
 
 
+def query_mistral_stream(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS):
+    """Query Phi3:mini with streaming"""
+    try:
+        response = requests.post(
+            f"{MISTRAL_API_URL}/chat/completions",
+            json={
+                "model": MISTRAL_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.3,
+                "max_tokens": max_tokens,
+                "top_p": 0.9,
+                "stream": True,
+            },
+            timeout=300,
+            stream=True
+        )
+        
+        if response.status_code != 200:
+            yield f"data: {json.dumps({'error': f'API error: {response.status_code}'})}\n\n"
+            return
+        
+        for line in response.iter_lines():
+            if line:
+                line_str = line.decode('utf-8')
+                if line_str.startswith('data: '):
+                    data_str = line_str[6:]
+                    if data_str.strip() == '[DONE]':
+                        break
+                    try:
+                        data = json.loads(data_str)
+                        if 'choices' in data and len(data['choices']) > 0:
+                            delta = data['choices'][0].get('delta', {})
+                            content = delta.get('content', '')
+                            if content:
+                                yield f"data: {json.dumps({'content': content})}\n\n"
+                    except json.JSONDecodeError:
+                        continue
+        
+        yield f"data: {json.dumps({'done': True})}\n\n"
+    
+    except requests.exceptions.ConnectionError:
+        yield f"data: {json.dumps({'error': 'Cannot connect to Phi3. Ensure Ollama is running'})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+
 def query_mistral(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS) -> str:
-    """Query Phi3:mini locally via Ollama"""
+    """Query Phi3:mini locally via Ollama (non-streaming)"""
     try:
         response = requests.post(
             f"{MISTRAL_API_URL}/chat/completions",
@@ -213,11 +260,6 @@ def query_mistral(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS) -> str:
                 "max_tokens": max_tokens,
                 "top_p": 0.9,
                 "stream": False,
-                "options": {
-                    "num_ctx": 4096,
-                    "num_thread": 8,
-                    "num_predict": max_tokens,
-                }
             },
             timeout=300,
             stream=False
@@ -270,20 +312,13 @@ async def upload_and_index(
     files: List[UploadFile] = File(...),
     file_paths: Optional[str] = Form(None)
 ):
-    """
-    Upload files and automatically index them into the vector store.
-    This is the main endpoint for adding new files.
-    Supports both individual files and folder uploads with structure preservation.
-    """
+    """Upload files and automatically index them into the vector store"""
     try:
-        # Ensure workspace exists
         if not os.path.exists(WORKSPACE_PATH):
             os.makedirs(WORKSPACE_PATH, exist_ok=True)
         
-        # Get or create collection
         embeddings, collection, searcher = get_or_create_collection()
         
-        # Parse file paths if provided (for folder uploads)
         paths_list = []
         if file_paths:
             try:
@@ -300,28 +335,18 @@ async def upload_and_index(
             if not file.filename:
                 continue
             
-            # Use relative path if available (folder upload), otherwise just filename
             if idx < len(paths_list) and paths_list[idx]:
                 relative_path = paths_list[idx].replace(" ", "_")
-                print(f"📁 Using folder path: {relative_path}")
             else:
                 relative_path = file.filename.replace(" ", "_")
-                print(f"📄 Using filename: {relative_path}")
             
-            # Create full path with subdirectories
             file_path = Path(WORKSPACE_PATH) / relative_path
-            
-            # Create parent directories if needed
             file_path.parent.mkdir(parents=True, exist_ok=True)
             
-            # Save file
             with open(file_path, "wb") as buffer:
                 content = await file.read()
                 buffer.write(content)
             
-            print(f"💾 Saved: {file_path}")
-            
-            # Index the file
             index_result = index_single_file(file_path, embeddings, collection)
             
             results.append({
@@ -344,18 +369,12 @@ async def upload_and_index(
         }
     
     except Exception as e:
-        print(f"❌ Upload error: {str(e)}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 
 @app.post("/index_workspace")
 def index_workspace():
-    """
-    Index all files in the workspace directory.
-    Use this to re-index existing files or after manual file additions.
-    """
+    """Index all files in the workspace directory"""
     try:
         workspace = Path(WORKSPACE_PATH)
         if not workspace.exists():
@@ -363,10 +382,8 @@ def index_workspace():
         
         embeddings, collection, searcher = get_or_create_collection()
         
-        # Get all files
         all_files = []
         for root, dirs, files in os.walk(workspace):
-            # Skip blacklisted folders
             dirs[:] = [d for d in dirs if d not in {"node_modules", "__pycache__", "venv", ".git"}]
             
             for file in files:
@@ -400,10 +417,7 @@ def index_workspace():
 
 @app.delete("/delete_file")
 def delete_file(file_path: str):
-    """
-    Delete a file from both filesystem and vector store.
-    file_path: relative path from workspace root (e.g., "script.py" or "folder/file.py")
-    """
+    """Delete a file from both filesystem and vector store"""
     try:
         embeddings, collection, searcher = get_or_create_collection()
         
@@ -412,10 +426,7 @@ def delete_file(file_path: str):
         if not full_path.exists():
             raise HTTPException(status_code=404, detail="File not found")
         
-        # Delete from vector store first
         delete_result = delete_file_from_collection(full_path, collection)
-        
-        # Delete from filesystem
         full_path.unlink()
         
         return {
@@ -433,29 +444,22 @@ def delete_file(file_path: str):
 
 @app.post("/reset_collection")
 def reset_collection():
-    """
-    Delete and recreate the entire collection.
-    WARNING: This removes all indexed data!
-    """
+    """Delete and recreate the entire collection"""
     global _collection, _searcher
     
     try:
         client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
         
-        # Delete existing collection
         try:
             client.delete_collection(name=CHROMA_COLLECTION_NAME)
-            print(f"🗑️ Deleted collection: {CHROMA_COLLECTION_NAME}")
         except Exception:
             pass
         
-        # Create new collection
         _collection = client.create_collection(
             name=CHROMA_COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"}
         )
         
-        # Reset searcher
         _searcher = None
         
         return {
@@ -474,17 +478,14 @@ def collection_stats():
     try:
         embeddings, collection, searcher = get_or_create_collection()
         
-        # Get all documents
         results = collection.get()
         total_chunks = len(results['ids'])
         
-        # Count unique files
         unique_files = set()
         for metadata in results.get('metadatas', []):
             if metadata and 'absolute_path' in metadata:
                 unique_files.add(metadata['absolute_path'])
         
-        # File type distribution
         file_types = {}
         for metadata in results.get('metadatas', []):
             if metadata and 'file_type' in metadata:
@@ -505,7 +506,7 @@ def collection_stats():
 
 
 @app.post("/ask")
-async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_filter: str = None):
+async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_filter: str = None, stream: bool = False):
     """Ask a question about the indexed codebase using RAG with Phi3:mini"""
     
     if not question or not question.strip():
@@ -517,7 +518,6 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
     try:
         embeddings, collection, searcher = get_or_create_collection()
         
-        # Search for relevant context
         search_results = searcher.search(
             query=question, 
             limit=context_limit, 
@@ -525,14 +525,20 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
         )
         
         if not search_results:
-            return {
-                "status": "success",
-                "question": question,
-                "answer": "No relevant context found in the knowledge base.",
-                "context_used": 0,
-                "sources": [],
-                "model": MISTRAL_MODEL
-            }
+            if stream:
+                async def no_context_stream():
+                    yield f"data: {json.dumps({'content': 'No relevant context found in the knowledge base.'})}\n\n"
+                    yield f"data: {json.dumps({'done': True, 'sources': []})}\n\n"
+                return StreamingResponse(no_context_stream(), media_type="text/event-stream")
+            else:
+                return {
+                    "status": "success",
+                    "question": question,
+                    "answer": "No relevant context found in the knowledge base.",
+                    "context_used": 0,
+                    "sources": [],
+                    "model": MISTRAL_MODEL
+                }
         
         # Build context
         context_chunks = []
@@ -553,7 +559,6 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
         
         context = "\n\n---SECTION---\n\n".join(context_chunks)
         
-        # Detect if asking for code
         asking_for_code = any(keyword in question.lower() for keyword in [
             'code', 'implement', 'write', 'program', 'function', 'class', 
             'script', 'assignment', 'solution', 'algorithm'
@@ -587,7 +592,17 @@ Provide a clear, detailed answer. Include code snippets if relevant using markdo
 
 ANSWER:"""
         
-        # Query LLM
+        # Streaming response
+        if stream:
+            async def generate_stream():
+                for chunk in query_mistral_stream(prompt, max_tokens=MAX_RESPONSE_TOKENS):
+                    yield chunk
+                # Send sources at the end
+                yield f"data: {json.dumps({'sources': sources, 'context_used': len(search_results)})}\n\n"
+            
+            return StreamingResponse(generate_stream(), media_type="text/event-stream")
+        
+        # Non-streaming response
         answer = query_mistral(prompt, max_tokens=MAX_RESPONSE_TOKENS)
         
         return {

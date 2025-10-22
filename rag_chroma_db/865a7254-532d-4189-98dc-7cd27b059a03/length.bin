@@ -1,14 +1,1 @@
-def list_all_files_in_nested_folders(root_dir):
-   
-    file_paths = []
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        for filename in filenames:
-            full_path = os.path.join(dirpath, filename)
-            file_paths.append(full_path)
-    return file_paths
-
-
-all_files = list_all_files_in_nested_folders(selected_folder)
-
-for file_path in all_files:
-    print(file_path)\"
+invalid type: string "def add_folder_to_workspace(workspace_path):\n    \"\"\"\n    Opens a directory dialog and recursively copies the entire folder contents.\n    \"\"\"\n    root = tk.Tk()\n    root.withdraw()\n    root.attributes('-topmost', True)  # Bring dialog to front\n\n    # askdirectory allows selection of a single folder\n    source_folder = filedialog.askdirectory(\nprint(file_path)""
