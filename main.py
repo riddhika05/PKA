@@ -134,6 +134,15 @@ def index_single_file(file_path: Path, embeddings, collection) -> dict:
         
         abs_path = str(file_path.resolve())
         
+        # Calculate relative path properly
+        try:
+            rel_path = str(file_path.relative_to(WORKSPACE_PATH))
+        except ValueError:
+            # File is outside workspace
+            rel_path = file_path.name
+        
+        print(f"📁 Indexing: {rel_path} (absolute: {abs_path})")
+        
         for idx, (chunk_text, start_char, end_char) in enumerate(chunks):
             chunk_text_clean = chunk_text.strip()
             if not chunk_text_clean:
@@ -141,7 +150,7 @@ def index_single_file(file_path: Path, embeddings, collection) -> dict:
             
             metadata = {
                 "filename": file_path.name,
-                "file_path": str(file_path.relative_to(WORKSPACE_PATH)) if WORKSPACE_PATH in str(file_path) else str(file_path),
+                "file_path": rel_path,  # Store relative path
                 "absolute_path": abs_path,
                 "project_name": file_path.parts[-2] if len(file_path.parts) > 1 else "root",
                 "file_type": ext,
@@ -157,6 +166,7 @@ def index_single_file(file_path: Path, embeddings, collection) -> dict:
             try:
                 emb = embeddings.embed(chunk_text_clean)
             except Exception as e:
+                print(f"❌ Embedding error for chunk {idx}: {e}")
                 continue
             
             batch_ids.append(doc_id)
@@ -172,6 +182,7 @@ def index_single_file(file_path: Path, embeddings, collection) -> dict:
                 embeddings=batch_embeddings,
                 metadatas=batch_metadatas
             )
+            print(f"✅ Added {len(batch_ids)} chunks for {rel_path}")
         
         return {
             "status": "success",
@@ -180,6 +191,7 @@ def index_single_file(file_path: Path, embeddings, collection) -> dict:
         }
     
     except Exception as e:
+        print(f"❌ Error indexing {file_path}: {e}")
         return {"status": "error", "reason": str(e)}
 
 
@@ -369,6 +381,8 @@ async def upload_and_index(
         }
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Upload error: {str(e)}")
 
 
@@ -412,6 +426,8 @@ def index_workspace():
         }
     
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Indexing error: {str(e)}")
 
 
@@ -439,6 +455,8 @@ def delete_file(file_path: str):
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Delete error: {str(e)}")
 
 
@@ -521,22 +539,21 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
         embeddings, collection, searcher = get_or_create_collection()
         
         # --- 1. Intent Detection for File Path Retrieval ---
-        # Checks if the user is explicitly asking for a file/path/source
         file_retrieval_keywords = [
             'file', 'path', 'source', 'location', 'give me', 'containing function', 
-            'function', 'class', 'module', 'script'
+            'function', 'class', 'module', 'script', 'where is', 'find'
         ]
         
         asking_for_code = any(keyword in question.lower() for keyword in [
-            'code', 'implement', 'write', 'program', 'function', 'class', 
-            'script', 'assignment', 'solution', 'algorithm'
+            'code', 'implement', 'write', 'program', 'create', 
+            'assignment', 'solution', 'algorithm', 'how to'
         ])
         
         asking_for_filepath_only = any(
-            keyword in question.lower() for keyword in ['file', 'path', 'source', 'location']
+            keyword in question.lower() for keyword in file_retrieval_keywords
         ) and not asking_for_code
-        
-        # --- 2. Perform RAG Search (Always necessary to find context) ---
+      
+        # --- 2. Perform RAG Search ---
         search_results = searcher.search(
             query=question, 
             limit=context_limit, 
@@ -544,11 +561,18 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
         )
         
         print(f"\n--- RAG Search Results for Question: '{question}' ---")
+        print(f"Asking for filepath only: {asking_for_filepath_only}")
+        print(f"Asking for code: {asking_for_code}")
+        
         if not search_results:
             print("No results found.")
         else:
             for i, result in enumerate(search_results):
-                print(f"[{i+1}] Relevance: {result['relevance']:.4f} | File: {result['file_path']}")
+                print(f"[{i+1}] Relevance: {result['relevance']:.4f}")
+                print(f"    File Path: '{result.get('file_path', 'EMPTY')}'")
+                print(f"    Absolute Path: '{result.get('absolute_path', 'EMPTY')}'")
+                print(f"    Filename: '{result.get('filename', 'EMPTY')}'")
+                print(f"    Project: '{result.get('project_name', 'EMPTY')}'")
         print("----------------------------------------------------------")
 
         # --- 3. Handle No Context Found ---
@@ -570,21 +594,43 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
 
         # --- 4. Handle Explicit File Path Request ---
         if asking_for_filepath_only:
-            # Get the single most relevant file path
             most_relevant_result = search_results[0]
-            file_path = most_relevant_result['file_path']
             
-            # Return the file path directly without calling the LLM
+            # Try multiple sources for the file path
+            file_path = (
+                most_relevant_result.get('file_path') or 
+                most_relevant_result.get('absolute_path') or 
+                'Unknown'
+            )
+            
+            print(f"Returning file path: '{file_path}'")
+            
+            if file_path == 'Unknown' or not file_path:
+                print("WARNING: File path is empty or unknown!")
+                print(f"Full result object: {most_relevant_result}")
+            
+            # Build a comprehensive answer with file details
+            answer_parts = [f"The most relevant file is: `{file_path}`"]
+            
+            if most_relevant_result.get('filename'):
+                answer_parts.append(f"\nFilename: **{most_relevant_result['filename']}**")
+            
+            if most_relevant_result.get('project_name'):
+                answer_parts.append(f"Project: **{most_relevant_result['project_name']}**")
+            
+            answer = "\n".join(answer_parts)
+            
             return {
                 "status": "success",
                 "question": question,
-                "answer": f"The most relevant file is: `{file_path}`",
+                "answer": answer,
                 "context_used": 1,
                 "sources": [{
-                    "filename": most_relevant_result["filename"],
+                    "filename": most_relevant_result.get("filename", "Unknown"),
                     "file_path": file_path,
-                    "project": most_relevant_result["project_name"],
-                    "relevance": most_relevant_result["relevance"]
+                    "absolute_path": most_relevant_result.get("absolute_path", ""),
+                    "project": most_relevant_result.get("project_name", "Unknown"),
+                    "relevance": most_relevant_result.get("relevance", 0)
                 }],
                 "model": MISTRAL_MODEL
             }
@@ -594,21 +640,24 @@ async def ask(question: str, context_limit: int = MAX_CONTEXT_CHUNKS, project_fi
         sources = []
         
         for result in search_results:
-            snippet = result["snippet"][:MAX_SNIPPET_CHARS]
-            if len(result["snippet"]) > MAX_SNIPPET_CHARS:
+            snippet = result.get("snippet", "")[:MAX_SNIPPET_CHARS]
+            if len(result.get("snippet", "")) > MAX_SNIPPET_CHARS:
                 snippet += "..."
             
             context_chunks.append(snippet)
+            
+            file_path = result.get('file_path') or result.get('absolute_path') or 'Unknown'
+            
             sources.append({
-                "filename": result["filename"],
-                "file_path": result["file_path"],
-                "project": result["project_name"],
-                "relevance": result["relevance"]
+                "filename": result.get("filename", "Unknown"),
+                "file_path": file_path,
+                "project": result.get("project_name", "Unknown"),
+                "relevance": result.get("relevance", 0)
             })
         
         context = "\n\n---SECTION---\n\n".join(context_chunks)
         
-        # Determine prompt type (Code Generation vs. General Answer)
+        # Determine prompt type
         if asking_for_code:
             prompt = f"""You are a code assistant. Extract and provide the complete code from the context below.
 
@@ -638,17 +687,14 @@ Provide a clear, detailed answer. Include code snippets if relevant using markdo
 ANSWER:"""
         
         # --- 6. LLM Response ---
-        # Streaming response
         if stream:
             async def generate_stream():
                 for chunk in query_mistral_stream(prompt, max_tokens=MAX_RESPONSE_TOKENS):
                     yield chunk
-                # Send sources at the end
                 yield f"data: {json.dumps({'sources': sources, 'context_used': len(search_results)})}\n\n"
             
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
         
-        # Non-streaming response
         answer = query_mistral(prompt, max_tokens=MAX_RESPONSE_TOKENS)
         
         return {
@@ -663,6 +709,8 @@ ANSWER:"""
     except HTTPException:
         raise
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
@@ -708,3 +756,13 @@ def list_files():
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    print(f"\n{'='*60}")
+    print(f"Starting RAG API Server")
+    print(f"Workspace: {WORKSPACE_PATH}")
+    print(f"Model: {MISTRAL_MODEL}")
+    print(f"{'='*60}\n")
+    uvicorn.run(app, host="127.0.0.1", port=8000)

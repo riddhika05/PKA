@@ -167,6 +167,20 @@ FUNCTION_PATTERNS = {
     ".cs": re.compile(r'^\s*(public|private|protected|internal)?\s*(static)?\s*[A-Za-z0-9_<>\[\]]+\s+[A-Za-z0-9_]+\s*\(', re.MULTILINE),
     ".jsx": re.compile(r'^\s*(const\s+[A-Za-z0-9_]+\s*=\s*\(.*?\)\s*=>|function\s+[A-Za-z0-9_]+|\b[A-Za-z0-9_]+\s*=\s*function\b|\bconst\s+[A-Za-z0-9_]+\s*=\s*function\b)', re.MULTILINE),
     ".tsx": re.compile(r'^\s*(const\s+[A-Za-z0-9_]+\s*=\s*\(.*?\)\s*=>|function\s+[A-Za-z0-9_]+|\b[A-Za-z0-9_]+\s*=\s*function\b|\bconst\s+[A-Za-z0-9_]+\s*=\s*function\b)', re.MULTILINE),
+    ".c": re.compile(
+        r'^\s*(?:static|extern|inline)?\s*(?:[\w*]+\s+){1,2}[A-Za-z0-9_]+\s*\(', 
+        re.MULTILINE
+    ),
+
+    # For C++ (.cpp) - Focuses on classes, structs, namespaces, and method/function definitions
+    # Catches: class MyClass {, struct Data {, namespace Utils {, int MyClass::method(
+    ".cpp": re.compile(
+        # 1. Class, Struct, or Namespace definition
+        r'^\s*(class|struct|namespace)\s+[A-Za-z0-9_:]+\s*(?::\s*[A-Za-z0-9_:]+)?\s*\{'  
+        # OR 
+        r'|^\s*(?:public|private|protected)?\s*(?:static|virtual|inline|explicit)?\s*[A-Za-z0-9_<>\[\]*&]+\s+[A-Za-z0-9_~:]+\s*\(', 
+        re.MULTILINE
+    ),
 }
 
 def chunk_code_by_functions(text: str, ext: str, max_chunk_chars: int = CHUNK_SIZE_CHARS, overlap: int = CHUNK_OVERLAP) -> List[Tuple[str,int,int]]:
