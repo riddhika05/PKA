@@ -22,8 +22,8 @@ WORKSPACE_PATH = r"C:\MyRAG_Knowledge_Base"
 
 WHITELIST_EXTENSIONS = {
     ".py", ".cs", ".js", ".ts", ".java", ".go",
-    ".html", ".css", ".md", ".txt", ".json",
-    ".csproj", ".sln", ".cshtml", ".config", ".xml",
+    ".html", ".css", ".md", ".txt",
+    ".cshtml",  ".xml",
     ".pdf", ".jsx", ".tsx", ".md", ".ppt", ".pptx",".cpp",".c"
 }
 

@@ -7,7 +7,7 @@ from typing import List, Optional
 import requests
 from pathlib import Path
 import time
-
+import shutil
 from build_VectorStore import (
     SimpleEmbeddings, 
     WorkspaceSearcher,
@@ -54,7 +54,7 @@ _searcher = None
 
 
 def get_or_create_collection():
-    """Get existing collection or create new one if doesn't exist"""
+    
     global _embeddings, _collection, _searcher
     
     if _embeddings is None:
@@ -306,10 +306,9 @@ def query_mistral(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS) -> str:
 
 @app.post("/setup_workspace")
 def setup_workspace():
-    """Create workspace directory if it doesn't exist"""
-    if os.path.exists(WORKSPACE_PATH):
-        return {"status": "success", "message": f"Workspace already exists at {WORKSPACE_PATH}"}
     
+    if os.path.exists(WORKSPACE_PATH):
+        return {"status": "success", "message": f"Workspace already exists at {WORKSPACE_PATH}"}  
     try:
         os.makedirs(WORKSPACE_PATH, exist_ok=True)
         return {"status": "success", "message": f"Workspace created at {WORKSPACE_PATH}"}
@@ -324,7 +323,6 @@ async def upload_and_index(
     files: List[UploadFile] = File(...),
     file_paths: Optional[str] = Form(None)
 ):
-    """Upload files and automatically index them into the vector store"""
     try:
         if not os.path.exists(WORKSPACE_PATH):
             os.makedirs(WORKSPACE_PATH, exist_ok=True)
@@ -464,7 +462,12 @@ def delete_file(file_path: str):
 def reset_collection():
     """Delete and recreate the entire collection"""
     global _collection, _searcher
-    
+    for item in Path(WORKSPACE_PATH).iterdir():
+       if item.is_file():
+        item.unlink()
+       elif item.is_dir():
+        shutil.rmtree(item)
+
     try:
         client = chromadb.PersistentClient(path=CHROMA_STORAGE_PATH)
         
