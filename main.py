@@ -42,7 +42,7 @@ ALLOWED_EXTENSIONS = {
     '.ppt', '.pptx',                                # Presentations
     '.csv',                                         # Data
     '.xml', '.json', '.yaml', '.yml',              # Config/Data
-    '.c', '.cpp', '.h', '.hpp',                    # C/C++
+    '.c', '.cpp',                   # C/C++
     '.cs', '.cshtml',                               # C#/Razor
     '.css', '.html', '.htm',                        # Web
     '.txt', '.md', '.log',                          # Text/Docs
@@ -249,7 +249,7 @@ async def upload_and_index(
                     "reader": reader.__class__.__name__,
                     "splitter": splitter_name,
                 })
-
+            logger.info(f"Indexing file: {relative_path} with splitter: {splitter_name}")
             processed_nodes = pipeline.run(documents=documents)
             
             total_chunks += len(processed_nodes)
@@ -290,40 +290,21 @@ def index_workspace():
         if not workspace.exists():
             raise HTTPException(status_code=404, detail="Workspace not found")
 
-        # Step 1: Get all files currently in the workspace
-        reader = SimpleDirectoryReader(
-            input_dir=str(workspace),
-            exclude_hidden=True,
-            recursive=True,
-            file_extractor=rag_config.FILE_EXTRACTOR,
-        )
+        # Step 1: Get all file paths in workspace
+        all_files = []
+        for root, dirs, filenames in os.walk(workspace):
+            # Filter out blacklisted directories
+            dirs[:] = [d for d in dirs if d not in BLACKLIST_FOLDERS]
+            
+            for filename in filenames:
+                if not filename.startswith('.'):
+                    file_path = Path(root) / filename
+                    # Only include whitelisted extensions
+                    if file_path.suffix.lower() in ALLOWED_EXTENSIONS:
+                        all_files.append(file_path)
 
-        documents = reader.load_data()
-        
         # Step 2: Build set of current file paths in workspace
-        current_files = set()
-        filtered_documents = []
-        
-        for doc in documents:
-            file_path = Path(doc.metadata.get('file_path', ''))
-            if file_path.suffix.lower() in ALLOWED_EXTENSIONS:
-                abs_path = str(file_path.resolve())
-                current_files.add(abs_path)
-                
-                # Get the splitter for this file type
-                file_splitter = get_file_splitter(file_path)
-                splitter_name = file_splitter.__class__.__name__
-                
-                doc.metadata.update({
-                    "file_path": str(file_path.relative_to(workspace)) if file_path.is_absolute() else str(file_path),
-                    "absolute_path": abs_path,
-                    "project_name": get_project_name(file_path, workspace),
-                    "filename": file_path.name,
-                    "file_type": file_path.suffix.lower(),
-                    "splitter": splitter_name,
-                })
-                doc.id_ = abs_path
-                filtered_documents.append(doc)
+        current_files = {str(f.resolve()) for f in all_files}
 
         # Step 3: Get all files currently indexed in ChromaDB
         existing_chunks = chroma_collection.get(include=["metadatas"])
@@ -345,22 +326,87 @@ def index_workspace():
             except Exception as e:
                 logger.warning(f"Failed to delete {deleted_file}: {e}")
 
-        # Step 5: Insert/update current documents
-        for doc in filtered_documents:
+        # Step 5: Process each file with its specific reader and splitter
+        total_indexed = 0
+        skipped_count = 0
+        pipeline_cache = {}
+        
+        for file_path in all_files:
             try:
+                abs_path = str(file_path.resolve())
+                
+                # Get file-specific reader
+                reader = get_file_reader(file_path)
+                
+                # Load document using the specific reader
+                try:
+                    documents = reader.load_data(file_path)
+                except Exception as e:
+                    logger.warning(f"Failed to read {file_path}: {e}")
+                    skipped_count += 1
+                    continue
+                
+                if not documents:
+                    skipped_count += 1
+                    continue
+                
+                # Get file-specific splitter
+                file_splitter = get_file_splitter(file_path)
+                splitter_name = file_splitter.__class__.__name__
+                
+                # Create or reuse pipeline for this splitter configuration
+                pipeline_key = (
+                    splitter_name,
+                    getattr(file_splitter, 'chunk_size', 0),
+                    getattr(file_splitter, 'chunk_overlap', 0)
+                )
+                
+                if pipeline_key not in pipeline_cache:
+                    pipeline = IngestionPipeline(
+                        transformations=[file_splitter, Settings.embed_model],
+                        vector_store=ChromaVectorStore(chroma_collection=chroma_collection),
+                    )
+                    pipeline_cache[pipeline_key] = pipeline
+                else:
+                    pipeline = pipeline_cache[pipeline_key]
+                
+                # Update metadata for all documents
+                file_size = file_path.stat().st_size
+                for doc in documents:
+                    doc.metadata.update({
+                        "file_path": str(file_path.relative_to(workspace)),
+                        "absolute_path": abs_path,
+                        "project_name": get_project_name(file_path, workspace),
+                        "filename": file_path.name,
+                        "file_size": file_size,
+                        "file_type": file_path.suffix.lower(),
+                        "reader": reader.__class__.__name__,
+                        "splitter": splitter_name,
+                    })
+                    doc.id_ = abs_path
+                
                 # Delete existing chunks for this file first
-                index.delete_ref_doc(ref_doc_id=doc.id_, delete_from_docstore=True)
-            except Exception:
-                pass  # File might not be indexed yet
-            
-            # Insert fresh chunks
-            index.insert(doc)
+                try:
+                    index.delete_ref_doc(ref_doc_id=abs_path, delete_from_docstore=True)
+                except Exception:
+                    pass  # File might not be indexed yet
+                
+                # Process with the file-specific pipeline
+                processed_nodes = pipeline.run(documents=documents)
+                total_indexed += 1
+                
+                logger.info(f"Indexed {file_path.name} with {len(processed_nodes)} chunks using {splitter_name}")
+                
+            except Exception as e:
+                logger.error(f"Error processing {file_path}: {e}")
+                skipped_count += 1
+                continue
 
         return {
             "status": "success",
-            "message": f"Indexed {len(filtered_documents)} documents, removed {deleted_count} deleted files",
-            "total_documents": len(filtered_documents),
-            "skipped_documents": len(documents) - len(filtered_documents),
+            "message": f"Indexed {total_indexed} documents, skipped {skipped_count}, removed {deleted_count} deleted files",
+            "total_documents": total_indexed,
+            "skipped_documents": skipped_count,
             "deleted_files": deleted_count,
             "deleted_file_paths": list(deleted_files) if deleted_files else [],
         }
@@ -369,7 +415,6 @@ def index_workspace():
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Indexing error: {str(e)}")
-
 
 @app.delete("/delete_file")
 def delete_file(file_path: str):
