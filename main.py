@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import chromadb
 import rag_config 
+import logging
 from rag_config import (
     get_file_reader,
     get_file_splitter,
@@ -33,11 +34,25 @@ MISTRAL_API_URL = "http://localhost:11434/v1"
 MISTRAL_MODEL = "phi3:mini"
 MAX_CONTEXT_CHUNKS = 3
 MAX_SNIPPET_CHARS = 600
-MAX_RESPONSE_TOKENS = 2048
+MAX_RESPONSE_TOKENS = 1024
 
+# Whitelist of allowed file extensions for indexing
+ALLOWED_EXTENSIONS = {
+    '.py', '.js', '.jsx', '.ts', '.tsx',           # JavaScript/Python
+    '.ppt', '.pptx',                                # Presentations
+    '.csv',                                         # Data
+    '.xml', '.json', '.yaml', '.yml',              # Config/Data
+    '.c', '.cpp', '.h', '.hpp',                    # C/C++
+    '.cs', '.cshtml',                               # C#/Razor
+    '.css', '.html', '.htm',                        # Web
+    '.txt', '.md', '.log',                          # Text/Docs
+    '.pdf', '.docx', '.doc',                        # Documents
+    '.java', '.kt', '.swift',                       # Other languages
+    '.go', '.rs', '.rb', '.php',                   # More languages
+    '.sh', '.ps1', '.bat',                          # Scripts
+}
 
 app = FastAPI()
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,6 +62,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+logger = logging.getLogger(__name__)
 
 def query_mistral_stream(prompt: str, max_tokens: int = MAX_RESPONSE_TOKENS):
     try:
@@ -181,6 +197,15 @@ async def upload_and_index(
                 results.append({"filename": file.filename, "status": "skipped", "reason": "Inside blacklisted folder"})
                 continue
 
+            # Check if file extension is in whitelist
+            if file_path.suffix.lower() not in ALLOWED_EXTENSIONS:
+                results.append({
+                    "filename": file.filename, 
+                    "status": "skipped", 
+                    "reason": f"File type {file_path.suffix} not in whitelist"
+                })
+                continue
+
             file_path.parent.mkdir(parents=True, exist_ok=True)
 
             content = await file.read()
@@ -265,6 +290,7 @@ def index_workspace():
         if not workspace.exists():
             raise HTTPException(status_code=404, detail="Workspace not found")
 
+        # Step 1: Get all files currently in the workspace
         reader = SimpleDirectoryReader(
             input_dir=str(workspace),
             exclude_hidden=True,
@@ -274,23 +300,69 @@ def index_workspace():
 
         documents = reader.load_data()
         
+        # Step 2: Build set of current file paths in workspace
+        current_files = set()
+        filtered_documents = []
+        
         for doc in documents:
             file_path = Path(doc.metadata.get('file_path', ''))
-            doc.metadata.update({
-                "file_path": str(file_path.relative_to(workspace)) if file_path.is_absolute() else str(file_path),
-                "absolute_path": str(file_path.resolve()),
-                "project_name": get_project_name(file_path, workspace),
-                "filename": file_path.name,
-            })
-            doc.id_ = str(file_path.resolve())
+            if file_path.suffix.lower() in ALLOWED_EXTENSIONS:
+                abs_path = str(file_path.resolve())
+                current_files.add(abs_path)
+                
+                # Get the splitter for this file type
+                file_splitter = get_file_splitter(file_path)
+                splitter_name = file_splitter.__class__.__name__
+                
+                doc.metadata.update({
+                    "file_path": str(file_path.relative_to(workspace)) if file_path.is_absolute() else str(file_path),
+                    "absolute_path": abs_path,
+                    "project_name": get_project_name(file_path, workspace),
+                    "filename": file_path.name,
+                    "file_type": file_path.suffix.lower(),
+                    "splitter": splitter_name,
+                })
+                doc.id_ = abs_path
+                filtered_documents.append(doc)
 
-        for doc in documents:
+        # Step 3: Get all files currently indexed in ChromaDB
+        existing_chunks = chroma_collection.get(include=["metadatas"])
+        indexed_files = set()
+        
+        for metadata in existing_chunks.get("metadatas", []):
+            if metadata and "absolute_path" in metadata:
+                indexed_files.add(metadata["absolute_path"])
+
+        # Step 4: Find deleted files (in index but not in workspace)
+        deleted_files = indexed_files - current_files
+        deleted_count = 0
+        
+        for deleted_file in deleted_files:
+            try:
+                index.delete_ref_doc(ref_doc_id=deleted_file, delete_from_docstore=True)
+                deleted_count += 1
+                logger.info(f"Removed chunks for deleted file: {deleted_file}")
+            except Exception as e:
+                logger.warning(f"Failed to delete {deleted_file}: {e}")
+
+        # Step 5: Insert/update current documents
+        for doc in filtered_documents:
+            try:
+                # Delete existing chunks for this file first
+                index.delete_ref_doc(ref_doc_id=doc.id_, delete_from_docstore=True)
+            except Exception:
+                pass  # File might not be indexed yet
+            
+            # Insert fresh chunks
             index.insert(doc)
 
         return {
             "status": "success",
-            "message": f"Indexed {len(documents)} documents from workspace",
-            "total_documents": len(documents),
+            "message": f"Indexed {len(filtered_documents)} documents, removed {deleted_count} deleted files",
+            "total_documents": len(filtered_documents),
+            "skipped_documents": len(documents) - len(filtered_documents),
+            "deleted_files": deleted_count,
+            "deleted_file_paths": list(deleted_files) if deleted_files else [],
         }
 
     except Exception as e:
@@ -419,7 +491,27 @@ async def ask(
         )
 
         retrieved_nodes: List[NodeWithScore] = retriever.retrieve(question)
-
+        
+        # Additional safety filter - only show whitelisted files in results
+        retrieved_nodes = [
+            node for node in retrieved_nodes 
+            if node.metadata.get("file_type", "").lower() in ALLOWED_EXTENSIONS
+        ]
+        
+        for idx, node in enumerate(retrieved_nodes):
+            md = node.metadata
+            file_path = md.get("file_path", "Unknown")
+            score = round(node.score, 4) if node.score else 0
+            
+            logger.info(f"\nChunk #{idx + 1}:")
+            logger.info(f"  Score: {score}")
+            logger.info(f"  File: {file_path}")
+            logger.info(f"  Filename: {md.get('filename', 'Unknown')}")
+            logger.info(f"  Project: {md.get('project_name', 'Unknown')}")
+            logger.info(f"  File Type: {md.get('file_type', 'Unknown')}")
+            logger.info(f"  Splitter: {md.get('splitter', 'Unknown')}")
+            logger.info(f"  Content Preview: {node.get_text()[:150]}...")
+            
         if project_filter:
             retrieved_nodes = [
                 node for node in retrieved_nodes 

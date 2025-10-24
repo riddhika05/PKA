@@ -21,3 +21,4 @@ beautifulsoup4
 torch
 sentence-transformers
 transformers
+tree-sitter
