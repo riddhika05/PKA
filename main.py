@@ -9,6 +9,8 @@ from pathlib import Path
 import shutil
 import chromadb
 import rag_config 
+import platform
+import subprocess
 import logging
 from rag_config import (
     get_file_reader,
@@ -605,8 +607,87 @@ async def ask(
                     "model": MISTRAL_MODEL,
                 }
 
+        # ===== FILE OPENING LOGIC =====
+        asking_to_open = "open" in question.lower()
+        
+        if asking_to_open and search_results:
+            most_relevant = search_results[0]
+            absolute_path = most_relevant.get("absolute_path", "")
+            file_path = most_relevant.get("file_path", "Unknown")
+            filename = most_relevant.get("filename", "Unknown")
+            
+            if absolute_path and os.path.exists(absolute_path):
+                try:
+                    system = platform.system()
+                    
+                    if system == 'Windows':
+                        os.startfile(absolute_path)
+                        open_status = f"✓ Opened {filename}"
+                    elif system == 'Darwin':  # macOS
+                        subprocess.call(['open', absolute_path])
+                        open_status = f"✓ Opened {filename}"
+                    else:  # Linux
+                        subprocess.call(['xdg-open', absolute_path])
+                        open_status = f"✓ Opened {filename}"
+                    
+                    logger.info(f"Opened file: {absolute_path}")
+                    
+                    # Return immediately without LLM call
+                    return {
+                        "status": "success",
+                        "question": question,
+                        "answer": f"**{open_status}**\n\nFile: `{file_path}`\nLocation: `{absolute_path}`",
+                        "context_used": 1,
+                        "file_opened": True,
+                        "sources": [
+                            {
+                                "filename": filename,
+                                "file_path": file_path,
+                                "absolute_path": absolute_path,
+                                "project": most_relevant.get("project_name", "Unknown"),
+                                "relevance": most_relevant.get("relevance", 0),
+                            }
+                        ],
+                        "model": MISTRAL_MODEL,
+                    }
+                    
+                except Exception as e:
+                    open_status = f"✗ Failed to open file: {str(e)}"
+                    logger.error(f"Error opening file: {e}")
+                    
+                    # Return error without calling LLM
+                    return {
+                        "status": "error",
+                        "question": question,
+                        "answer": open_status,
+                        "context_used": 1,
+                        "file_opened": False,
+                        "sources": [
+                            {
+                                "filename": filename,
+                                "file_path": file_path,
+                                "absolute_path": absolute_path,
+                                "project": most_relevant.get("project_name", "Unknown"),
+                                "relevance": most_relevant.get("relevance", 0),
+                            }
+                        ],
+                        "model": MISTRAL_MODEL,
+                    }
+            else:
+                # File doesn't exist - return error without LLM
+                return {
+                    "status": "error",
+                    "question": question,
+                    "answer": f"✗ File not found: {file_path}",
+                    "context_used": 0,
+                    "file_opened": False,
+                    "sources": [],
+                    "model": MISTRAL_MODEL,
+                }
+        # ===== END FILE OPENING LOGIC =====
+
         file_retrieval_keywords = [
-            "filepath", "source", "location", "give me", "containing function","which has","which contains"
+            "filepath", "source", "location", "give me", "containing function","which has","which contains",
             "function", "class", "module", "script", "where is", "find","file_path","path of file"
         ]
         asking_for_code = any(keyword in question.lower() for keyword in ["code", "implement", "write",  "create", "assignment", "solution", "algorithm", "how to"])
@@ -624,6 +705,7 @@ async def ask(
                 answer_parts.append(f"\nFilename: **{most_relevant_result['filename']}**")
             if most_relevant_result.get("project_name"):
                 answer_parts.append(f"Project: **{most_relevant_result['project_name']}**")
+            
             answer = "\n".join(answer_parts)
 
             return {
@@ -631,6 +713,7 @@ async def ask(
                 "question": question,
                 "answer": answer,
                 "context_used": 1,
+                "file_opened": False,
                 "sources": [
                     {
                         "filename": most_relevant_result.get("filename", "Unknown"),
@@ -647,7 +730,7 @@ async def ask(
         sources = []
 
         for result in search_results:
-            source_header = f"FILE_SOURCE: {result["filename"]} (Path: {result["file_path"]})\n\n"
+            source_header = f"FILE_SOURCE: {result['filename']} (Path: {result['file_path']})\n\n"
             context_chunks.append(result["full_content"]+source_header)
             sources.append(
                 {
@@ -705,6 +788,7 @@ ANSWER:"""
             "question": question,
             "answer": answer,
             "context_used": len(search_results),
+            "file_opened": False,
             "sources": sources,
             "model": MISTRAL_MODEL,
         }
@@ -715,7 +799,6 @@ ANSWER:"""
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
-
 
 @app.get("/health")
 def health():
@@ -777,3 +860,5 @@ if __name__ == "__main__":
     print(f"Model: {MISTRAL_MODEL}")
     print(f"{'='*60}\n")
     uvicorn.run(app, host="127.0.0.1", port=8000)
+
+
