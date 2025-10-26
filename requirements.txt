@@ -22,3 +22,4 @@ torch
 sentence-transformers
 transformers
 tree-sitter
+tree-sitter-languages
