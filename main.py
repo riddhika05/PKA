@@ -606,10 +606,10 @@ async def ask(
                 }
 
         file_retrieval_keywords = [
-            "file", "path", "source", "location", "give me", "containing function",
-            "function", "class", "module", "script", "where is", "find",
+            "filepath", "source", "location", "give me", "containing function","which has","which contains"
+            "function", "class", "module", "script", "where is", "find","file_path","path of file"
         ]
-        asking_for_code = any(keyword in question.lower() for keyword in ["code", "implement", "write", "program", "create", "assignment", "solution", "algorithm", "how to"])
+        asking_for_code = any(keyword in question.lower() for keyword in ["code", "implement", "write",  "create", "assignment", "solution", "algorithm", "how to"])
         asking_for_filepath_only = (
             any(keyword in question.lower() for keyword in file_retrieval_keywords)
             and not asking_for_code
@@ -647,7 +647,8 @@ async def ask(
         sources = []
 
         for result in search_results:
-            context_chunks.append(result["full_content"])
+            source_header = f"FILE_SOURCE: {result["filename"]} (Path: {result["file_path"]})\n\n"
+            context_chunks.append(result["full_content"]+source_header)
             sources.append(
                 {
                     "filename": result["filename"],
